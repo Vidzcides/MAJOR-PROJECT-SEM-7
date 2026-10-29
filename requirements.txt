@@ -1,0 +1,11 @@
+streamlit
+osmnx>=2.0
+networkx
+numpy
+pandas
+matplotlib
+folium
+streamlit-folium
+pymoo>=0.6
+requests
+scikit-learn
