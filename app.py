@@ -10,6 +10,7 @@ import math
 import os
 import pickle
 import random
+import re
 import time as time_module
 
 import folium
@@ -346,19 +347,83 @@ def crop_local_graph(center_lat, center_lon, radius_m):
     return Gc.subgraph(biggest).copy()
 
 
-@st.cache_resource(show_spinner=False)
+# Built-in Mumbai places (lat, lon). APPROXIMATE (typically within a few hundred
+# metres of the area centre); the route is snapped to the nearest saved road node.
+# For an exact spot, type "lat, lon" in the custom-coordinates boxes instead.
+MUMBAI_PLACES = {
+    "Colaba": (18.9067, 72.8147),
+    "Cuffe Parade": (18.9140, 72.8200),
+    "Gateway of India": (18.9220, 72.8347),
+    "Nariman Point": (18.9256, 72.8242),
+    "Churchgate": (18.9322, 72.8264),
+    "CSMT (Chhatrapati Shivaji Terminus)": (18.9398, 72.8355),
+    "Marine Lines": (18.9435, 72.8238),
+    "Girgaon Chowpatty": (18.9543, 72.8130),
+    "Malabar Hill": (18.9548, 72.7985),
+    "Grant Road": (18.9634, 72.8153),
+    "Mazgaon": (18.9689, 72.8444),
+    "Mumbai Central": (18.9690, 72.8205),
+    "Byculla": (18.9766, 72.8326),
+    "Lower Parel": (18.9953, 72.8305),
+    "Worli": (19.0090, 72.8180),
+    "Parel": (19.0090, 72.8410),
+    "Prabhadevi": (19.0150, 72.8290),
+    "Dadar": (19.0178, 72.8478),
+    "Wadala": (19.0170, 72.8610),
+    "Matunga": (19.0270, 72.8560),
+    "Dharavi": (19.0400, 72.8540),
+    "Sion": (19.0390, 72.8619),
+    "Mahim": (19.0409, 72.8404),
+    "Chembur": (19.0522, 72.9005),
+    "Bandra West": (19.0596, 72.8295),
+    "Bandra East": (19.0600, 72.8420),
+    "Bandra Kurla Complex (BKC)": (19.0660, 72.8680),
+    "Khar": (19.0720, 72.8360),
+    "Kurla": (19.0728, 72.8826),
+    "Santacruz": (19.0820, 72.8410),
+    "Ghatkopar": (19.0860, 72.9080),
+    "Mumbai Airport (T2)": (19.0896, 72.8656),
+    "Vile Parle": (19.0990, 72.8440),
+    "Juhu": (19.1075, 72.8263),
+    "Chandivali": (19.1090, 72.8980),
+    "Vikhroli": (19.1110, 72.9270),
+    "Andheri East": (19.1150, 72.8690),
+    "Powai": (19.1176, 72.9060),
+    "Andheri Station": (19.1197, 72.8464),
+    "Kanjurmarg": (19.1290, 72.9300),
+    "Versova": (19.1310, 72.8100),
+    "Andheri West": (19.1360, 72.8290),
+    "Jogeshwari": (19.1360, 72.8490),
+    "Bhandup": (19.1430, 72.9370),
+    "Goregaon": (19.1663, 72.8526),
+    "Mulund": (19.1726, 72.9560),
+    "Malad": (19.1860, 72.8480),
+    "Kandivali": (19.2040, 72.8520),
+    "Borivali": (19.2307, 72.8567),
+    "Dahisar": (19.2500, 72.8590),
+}
+
+
 def geocode_place(query):
-    last_err = None
-    for attempt in range(3):
-        try:
-            return ox.geocode(query)
-        except Exception as e:
-            last_err = e
-            time_module.sleep(2 * (attempt + 1))
-    raise ConnectionError(
-        f"Couldn't geocode '{query}' after several tries (last error: {last_err}). "
-        "The geocoding service may be temporarily unavailable — try again shortly."
-    )
+    """Offline place lookup: 'lat, lon' text, or a name from MUMBAI_PLACES.
+    No internet needed."""
+    q = query.strip()
+    nums = re.findall(r"-?\d+(?:\.\d+)?", q)
+    if len(nums) == 2 and re.fullmatch(r"\s*-?\d+(?:\.\d+)?\s*[,\s]\s*-?\d+(?:\.\d+)?\s*", q):
+        lat, lon = float(nums[0]), float(nums[1])
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError(f"'{query}' isn't a valid latitude, longitude pair.")
+        return lat, lon
+    lowered = {name.lower(): name for name in MUMBAI_PLACES}
+    key = q.lower()
+    if key in lowered:
+        return MUMBAI_PLACES[lowered[key]]
+    matches = [n for low, n in lowered.items() if key and key in low]
+    if len(matches) == 1:
+        return MUMBAI_PLACES[matches[0]]
+    hint = f" Did you mean: {', '.join(matches[:5])}?" if matches else ""
+    raise ValueError(f"Couldn't find '{query}' in the built-in Mumbai places.{hint} "
+                     "Pick a name from the list, or enter coordinates as 'lat, lon'.")
 
 
 # ----------------------------------------------------------------------------
@@ -451,7 +516,7 @@ class ProgressCallback(Callback):
 def run_pipeline(from_query, to_query, radius_m, traffic_key=None, progress=None):
     progress = progress or (lambda msg: None)
     t_start = time_module.time()
-    progress("Step 1/3: looking up the two places (needs internet)...")
+    progress("Step 1/3: looking up the two places (offline)...")
     from_pt = geocode_place(from_query)
     to_pt = geocode_place(to_query)
     t_geo = time_module.time()
@@ -553,11 +618,21 @@ if not (os.path.exists(READY_GRAPH_FILE) or os.path.exists(LOCAL_GRAPH_FILE)):
              "download_mumbai.py to create it. This app does not download maps online.")
     st.stop()
 
+PLACE_NAMES = sorted(MUMBAI_PLACES)
 col1, col2 = st.columns(2)
 with col1:
-    from_input = st.text_input("From", placeholder="e.g. Bandra West, Mumbai, India")
+    from_sel = st.selectbox("From", PLACE_NAMES, index=None,
+                            placeholder="Type to search, e.g. Bandra West")
 with col2:
-    to_input = st.text_input("To", placeholder="e.g. Andheri East, Mumbai, India")
+    to_sel = st.selectbox("To", PLACE_NAMES, index=None,
+                          placeholder="Type to search, e.g. Andheri East")
+with st.expander("Use exact coordinates instead (optional)"):
+    cc1, cc2 = st.columns(2)
+    from_custom = cc1.text_input("From (lat, lon)", placeholder="e.g. 19.0596, 72.8295")
+    to_custom = cc2.text_input("To (lat, lon)", placeholder="e.g. 19.1136, 72.8697")
+# A typed coordinate pair, if given, overrides the dropdown choice.
+from_input = from_custom.strip() or (from_sel or "")
+to_input = to_custom.strip() or (to_sel or "")
 
 radius_m = st.slider("Area radius (meters)", min_value=1000, max_value=MAX_RADIUS_M,
                       value=DEFAULT_RADIUS_M, step=500,
