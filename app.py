@@ -283,56 +283,10 @@ class RouteDuplicateElimination(ElementwiseDuplicateElimination):
 # Cached graph construction
 # ----------------------------------------------------------------------------
 
-LOCAL_GRAPH_FILE = "mumbai_graph.pkl.gz"  # made by download_mumbai.py; used if present
+LOCAL_GRAPH_FILE = "mumbai_graph.pkl.gz"  # made by download_mumbai.py (required)
 
-# The main overpass-api.de instance is a shared free public service and is
-# frequently overloaded / briefly refuses connections. Retry across a few
-# known public mirrors with backoff before giving up, instead of failing on
-# the first hiccup.
-OVERPASS_MIRRORS = [
-    "https://overpass-api.de/api",
-    "https://overpass.kumi.systems/api",
-    "https://lz4.overpass-api.de/api",
-]
-
-
-def _download_graph_with_retries(center_lat, center_lon, radius_m, attempts_per_mirror=2):
-    last_err = None
-    for mirror in OVERPASS_MIRRORS:
-        ox.settings.overpass_url = mirror
-        ox.settings.overpass_endpoint = "interpreter"
-        for attempt in range(attempts_per_mirror):
-            try:
-                return ox.graph_from_point((center_lat, center_lon), dist=radius_m,
-                                            network_type="drive")
-            except Exception as e:
-                last_err = e
-                time_module.sleep(2 * (attempt + 1))  # brief backoff before retrying
-    raise ConnectionError(
-        "Couldn't reach any OpenStreetMap road-data server after several tries "
-        f"(last error: {last_err}). This is usually a temporary outage on their "
-        "free public service — please wait a minute and try again."
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def build_graph(center_lat, center_lon, radius_m):
-    """Download + weight the road graph. Cached per (rounded center, radius)
-    so repeated requests for the same area don't re-hit OSM."""
-    G = _download_graph_with_retries(center_lat, center_lon, radius_m)
-    G = ox.routing.add_edge_speeds(G, fallback=30)  # 30 kph default for untagged roads,
-                                                      # matches compute_edge_weights' own default
-    G = ox.routing.add_edge_travel_times(G)
-
-    node_degree = dict(G.degree())
-    for u, v, k, data in G.edges(keys=True, data=True):
-        t, d, f, r = compute_edge_weights(u, v, data, node_degree)
-        data["time"] = t
-        data["distance"] = d
-        data["fuel"] = f
-        data["risk"] = r
-    add_junction_delays(G)
-    return G
+# This app uses ONLY the saved Mumbai road network. It never downloads road
+# data from OpenStreetMap/Overpass.
 
 
 @st.cache_resource(show_spinner="Loading the saved Mumbai road network (first time only)...")
@@ -466,10 +420,7 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
     center_lat = (from_pt[0] + to_pt[0]) / 2
     center_lon = (from_pt[1] + to_pt[1]) / 2
 
-    if os.path.exists(LOCAL_GRAPH_FILE):
-        G = crop_local_graph(center_lat, center_lon, radius_m)  # no internet needed
-    else:
-        G = build_graph(round(center_lat, 4), round(center_lon, 4), radius_m)
+    G = crop_local_graph(center_lat, center_lon, radius_m)  # local file only, no download
     traffic_note = None
     if traffic_key:
         G = G.copy()  # never mutate the cached graph
@@ -550,6 +501,12 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
 st.title("🚗 OptiRoute")
 st.caption("Multi-objective route optimization — no single best route, only trade-offs.")
 
+if not os.path.exists(LOCAL_GRAPH_FILE):
+    st.error(f"Saved map file `{LOCAL_GRAPH_FILE}` was not found next to app.py. "
+             "Add it to the repo (use Git LFS if it is over 100 MB) or run "
+             "download_mumbai.py to create it. This app does not download maps online.")
+    st.stop()
+
 col1, col2 = st.columns(2)
 with col1:
     from_input = st.text_input("From", placeholder="e.g. Bandra West, Mumbai, India")
@@ -558,8 +515,8 @@ with col2:
 
 radius_m = st.slider("Area radius (meters)", min_value=1000, max_value=MAX_RADIUS_M,
                       value=DEFAULT_RADIUS_M, step=500,
-                      help="Road network is downloaded around the midpoint of your two "
-                           "locations, out to this radius. Larger = slower to compute.")
+                      help="Road network is cut from the saved Mumbai map around the midpoint of "
+                           "your two locations, out to this radius. Larger = slower to compute.")
 
 priority_choice = st.selectbox("Priority", list(PRIORITY_PRESETS.keys()) + ["Advanced"])
 
@@ -601,8 +558,8 @@ if find_clicked:
         cache_key = (from_input.strip().lower(), to_input.strip().lower(), radius_m,
                      bool(use_traffic and tomtom_key))
         try:
-            with st.spinner("Finding optimal routes... (downloading road network, "
-                             "running NSGA-III — this can take 20–60s)"):
+            with st.spinner("Finding optimal routes using the saved Mumbai map... "
+                             "(running NSGA-III)"):
                 result = run_pipeline(from_input, to_input, radius_m,
                                       tomtom_key if use_traffic else None)
             st.session_state["optiroute_result"] = result
