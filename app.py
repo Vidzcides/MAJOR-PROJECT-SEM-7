@@ -22,6 +22,7 @@ import streamlit as st
 from streamlit_folium import st_folium
 
 from pymoo.algorithms.moo.nsga3 import NSGA3
+from pymoo.core.callback import Callback
 from pymoo.core.crossover import Crossover
 from pymoo.core.duplicate import ElementwiseDuplicateElimination
 from pymoo.core.mutation import Mutation
@@ -35,6 +36,7 @@ from pymoo.util.ref_dirs import get_reference_directions
 # ----------------------------------------------------------------------------
 
 ox.settings.log_console = False
+ox.settings.requests_timeout = 15  # fail fast instead of hanging for minutes on geocoding
 random.seed(42)
 np.random.seed(42)
 
@@ -283,7 +285,8 @@ class RouteDuplicateElimination(ElementwiseDuplicateElimination):
 # Cached graph construction
 # ----------------------------------------------------------------------------
 
-LOCAL_GRAPH_FILE = "mumbai_graph.pkl.gz"  # made by download_mumbai.py (required)
+LOCAL_GRAPH_FILE = "mumbai_graph.pkl.gz"  # made by download_mumbai.py (raw map)
+READY_GRAPH_FILE = "mumbai_graph_ready.pkl"  # made by preprocess_graph.py (fast, preferred)
 
 # This app uses ONLY the saved Mumbai road network. It never downloads road
 # data from OpenStreetMap/Overpass.
@@ -291,18 +294,38 @@ LOCAL_GRAPH_FILE = "mumbai_graph.pkl.gz"  # made by download_mumbai.py (required
 
 @st.cache_resource(show_spinner="Loading the saved Mumbai road network (first time only)...")
 def load_local_graph():
-    """Load the pre-downloaded road network once, weight every edge once, and
-    keep node coordinates as arrays so cropping per trip is fast."""
-    import gzip
-    with gzip.open(LOCAL_GRAPH_FILE, "rb") as f:
-        G = pickle.load(f)
-    G = ox.routing.add_edge_speeds(G, fallback=30)
-    G = ox.routing.add_edge_travel_times(G)
-    node_degree = dict(G.degree())
-    for u, v, k, data in G.edges(keys=True, data=True):
-        t, d, f_, r = compute_edge_weights(u, v, data, node_degree)
-        data["time"], data["distance"], data["fuel"], data["risk"] = t, d, f_, r
-    add_junction_delays(G)
+    """Load the road network once and keep node coordinates as arrays so
+    cropping per trip is fast. If the pre-weighted, slimmed file made by
+    preprocess_graph.py exists, load it directly (fast, low memory). Otherwise
+    fall back to weighting the raw graph here (slow, memory-hungry)."""
+    t0 = time_module.time()
+    source = "ready file"
+    if os.path.exists(READY_GRAPH_FILE):
+        with open(READY_GRAPH_FILE, "rb") as f:
+            G = pickle.load(f)
+    else:
+        import gzip
+        source = "raw file"
+        with gzip.open(LOCAL_GRAPH_FILE, "rb") as f:
+            G = pickle.load(f)
+    t_read = time_module.time() - t0
+
+    # The ready file must already carry the four weights. If it doesn't (e.g. it
+    # was made by an older script), weight it here instead of crashing later.
+    sample = next(iter(G.edges(data=True)), (None, None, {}))[2]
+    if not all(k in sample for k in ("time", "distance", "fuel", "risk")):
+        source += " + weighted at startup"
+        G = ox.routing.add_edge_speeds(G, fallback=30)
+        G = ox.routing.add_edge_travel_times(G)
+        node_degree = dict(G.degree())
+        for u, v, k, data in G.edges(keys=True, data=True):
+            t, d, f_, r = compute_edge_weights(u, v, data, node_degree)
+            data["time"], data["distance"], data["fuel"], data["risk"] = t, d, f_, r
+        add_junction_delays(G)
+    G.graph["load_info"] = (f"Map: {source}, {G.number_of_nodes():,} nodes / "
+                            f"{G.number_of_edges():,} edges, read in {t_read:.0f}s, "
+                            f"ready in {time_module.time() - t0:.0f}s")
+    print(G.graph["load_info"], flush=True)
     ids = np.array(list(G.nodes))
     lat = np.array([G.nodes[n]["y"] for n in ids])
     lon = np.array([G.nodes[n]["x"] for n in ids])
@@ -413,14 +436,32 @@ def path_to_coords(G, path):
 # ----------------------------------------------------------------------------
 
 
-def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
+class ProgressCallback(Callback):
+    """Reports the NSGA-III generation number to the UI as it runs."""
+
+    def __init__(self, progress, total):
+        super().__init__()
+        self.progress, self.total = progress, total
+
+    def notify(self, algorithm):
+        self.progress(f"Step 3/3: optimizing routes (NSGA-III generation "
+                      f"{algorithm.n_gen}/{self.total})...")
+
+
+def run_pipeline(from_query, to_query, radius_m, traffic_key=None, progress=None):
+    progress = progress or (lambda msg: None)
+    t_start = time_module.time()
+    progress("Step 1/3: looking up the two places (needs internet)...")
     from_pt = geocode_place(from_query)
     to_pt = geocode_place(to_query)
+    t_geo = time_module.time()
+    progress("Step 2/3: loading the saved map and cropping the area...")
 
     center_lat = (from_pt[0] + to_pt[0]) / 2
     center_lon = (from_pt[1] + to_pt[1]) / 2
 
     G = crop_local_graph(center_lat, center_lon, radius_m)  # local file only, no download
+    t_crop = time_module.time()
     traffic_note = None
     if traffic_key:
         G = G.copy()  # never mutate the cached graph
@@ -464,7 +505,10 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
         eliminate_duplicates=RouteDuplicateElimination(),
     )
     problem = RouteProblem(G, origin, dest)
-    res = minimize(problem, algorithm, ("n_gen", N_GEN), seed=1, verbose=False)
+    t_opt0 = time_module.time()
+    res = minimize(problem, algorithm, ("n_gen", N_GEN), seed=1, verbose=False,
+                   callback=ProgressCallback(progress, N_GEN))
+    t_opt = time_module.time()
 
     pareto_routes, pareto_costs, seen = [], [], set()
     for x in res.X:
@@ -491,6 +535,8 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
         "baseline_path": baseline_path,
         "pareto_routes": pareto_routes, "pareto_costs": pareto_costs,
         "traffic_note": traffic_note,
+        "timings": (f"Timings: geocoding {t_geo - t_start:.0f}s, map load + crop "
+                    f"{t_crop - t_geo:.0f}s, NSGA-III {t_opt - t_opt0:.0f}s"),
     }
 
 
@@ -501,7 +547,7 @@ def run_pipeline(from_query, to_query, radius_m, traffic_key=None):
 st.title("🚗 OptiRoute")
 st.caption("Multi-objective route optimization — no single best route, only trade-offs.")
 
-if not os.path.exists(LOCAL_GRAPH_FILE):
+if not (os.path.exists(READY_GRAPH_FILE) or os.path.exists(LOCAL_GRAPH_FILE)):
     st.error(f"Saved map file `{LOCAL_GRAPH_FILE}` was not found next to app.py. "
              "Add it to the repo (use Git LFS if it is over 100 MB) or run "
              "download_mumbai.py to create it. This app does not download maps online.")
@@ -558,10 +604,11 @@ if find_clicked:
         cache_key = (from_input.strip().lower(), to_input.strip().lower(), radius_m,
                      bool(use_traffic and tomtom_key))
         try:
-            with st.spinner("Finding optimal routes using the saved Mumbai map... "
-                             "(running NSGA-III)"):
+            with st.status("Starting...", expanded=True) as status:
                 result = run_pipeline(from_input, to_input, radius_m,
-                                      tomtom_key if use_traffic else None)
+                                      tomtom_key if use_traffic else None,
+                                      progress=lambda msg: status.update(label=msg))
+                status.update(label="Done", state="complete", expanded=False)
             st.session_state["optiroute_result"] = result
             st.session_state["optiroute_key"] = cache_key
         except ValueError as e:
@@ -655,5 +702,9 @@ if result is not None:
 
     st.caption(f"{len(pareto_routes)} validated Pareto-optimal routes found across "
                f"{G.number_of_nodes()} intersections / {G.number_of_edges()} road segments.")
+    if G.graph.get("load_info"):
+        st.caption(G.graph["load_info"])
+    if result.get("timings"):
+        st.caption(result["timings"])
 else:
     st.info("Enter a From and To location, then click **Find Route**.")
